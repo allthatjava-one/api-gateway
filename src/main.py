@@ -129,6 +129,85 @@ async def _fetch_compress_with_timeout(
         clearTimeout(timeout_id)
 
 
+async def _call_convert_service_with_retry(
+    external_url: str,
+    body: dict,
+    compressed_pdf_fetch_timeout_seconds: float,
+):
+    deadline = time.monotonic() + MAX_COMPRESS_WAIT_SECONDS
+    attempt = 0
+    retry_delay = DEFAULT_INITIAL_RETRY_DELAY_SECONDS
+    last_error = "Convert service did not become ready in time."
+
+    while time.monotonic() < deadline:
+        attempt += 1
+        ext_resp, fetch_error = await _fetch_convert_with_timeout(
+            external_url,
+            body,
+            compressed_pdf_fetch_timeout_seconds,
+        )
+        if ext_resp is None:
+            last_error = fetch_error
+
+        if ext_resp is not None:
+            if ext_resp.ok:
+                return ext_resp, ""
+
+            body_text = await ext_resp.text()
+            if ext_resp.status not in TRANSIENT_STATUS_CODES:
+                return None, f"Convert service returned {ext_resp.status}: {body_text[:200]}"
+
+            last_error = (
+                f"Convert service temporary failure ({ext_resp.status}): {body_text[:200]}"
+            )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+
+        sleep_for = min(retry_delay, remaining)
+        print(
+            f"[pdf-converter] attempt {attempt} failed, retrying in {sleep_for:.1f}s"
+        )
+        await asyncio.sleep(sleep_for)
+        retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY_SECONDS)
+
+    return None, last_error
+
+
+async def _fetch_convert_with_timeout(
+    convert_url: str,
+    body: dict,
+    compressed_pdf_fetch_timeout_seconds: float,
+):
+    controller = AbortController.new()
+    timeout_ms = max(1, int(compressed_pdf_fetch_timeout_seconds * 1000))
+    timeout_id = setTimeout(controller.abort, timeout_ms)
+
+    try:
+        ext_resp = await js_fetch(
+            convert_url,
+            to_js(
+                {
+                    "method": "POST",
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps(body),
+                    "signal": controller.signal,
+                },
+                dict_converter=Object.fromEntries,
+            ),
+        )
+        return ext_resp, ""
+    except Exception as exc:
+        error_name = getattr(exc, "name", "")
+        error_text = str(exc)
+        if error_name == "AbortError" or "AbortError" in error_text:
+            return None, f"Convert service request timed out after {compressed_pdf_fetch_timeout_seconds}s."
+        return None, f"Failed to call convert service: {exc}"
+    finally:
+        clearTimeout(timeout_id)
+
+
 def _handle_preflight(request, allowed_origins: list) -> Response:
     origin = request.headers.get("Origin") or ""
     if origin not in allowed_origins:
@@ -163,12 +242,12 @@ async def _handle_pdf_compressor(request, env, origin: str) -> Response:
     if not isinstance(body, dict):
         return _error(400, "Request body must be a JSON object.", origin)
 
-    object_key = body.get("object_key")
+    object_key = body.get("objectKey")
     if not object_key:
-        return _error(400, "Missing required field: object_key.", origin)
+        return _error(400, "Missing required field: objectKey.", origin)
 
     if not isinstance(object_key, str):
-        return _error(400, "object_key must be a string.", origin)
+        return _error(400, "objectKey must be a string.", origin)
     # Call external compress service which returns a presigned key
     # external_url = "http://localhost:8787/compress"
     external_url = env.SERVICE_PDF_COMPRESS_URL
@@ -209,6 +288,73 @@ async def _handle_pdf_compressor(request, env, origin: str) -> Response:
         return _error(502, "Compress service did not return presignedUrl.", origin)
 
     return _json_response({"presignedUrl": presigned}, 200, origin)
+
+
+async def _handle_pdf_converter(request, env, origin: str) -> Response:
+    # Parse body (same validation as pdf-compressor)
+    try:
+        body = await request.json()
+    except Exception:
+        return _error(400, "Request body must be valid JSON.", origin)
+
+    if not isinstance(body, dict):
+        return _error(400, "Request body must be a JSON object.", origin)
+
+    object_key = body.get("objectKey")
+    if not object_key:
+        return _error(400, "Missing required field: objectKey.", origin)
+
+    if not isinstance(object_key, str):
+        return _error(400, "objectKey must be a string.", origin)
+
+    # Read backend convert service URL from env
+    convert_url = getattr(env, "SERVICE_PDF_CONVERT_URL", None)
+    if not convert_url:
+        return _error(500, "Missing required environment variable: SERVICE_PDF_CONVERT_URL.", origin)
+
+    compressed_pdf_fetch_timeout_seconds = DEFAULT_COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS
+    fetch_timeout_raw = getattr(env, "COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS", None)
+    if fetch_timeout_raw is not None:
+        try:
+            configured_timeout = float(fetch_timeout_raw)
+            if configured_timeout > 0:
+                compressed_pdf_fetch_timeout_seconds = configured_timeout
+        except (TypeError, ValueError):
+            print(
+                "[pdf-converter] invalid COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS; using default"
+            )
+
+    print(f"[pdf-converter] calling external convert service for: {object_key}")
+    ext_resp, call_error = await _call_convert_service_with_retry(
+        convert_url,
+        body,
+        compressed_pdf_fetch_timeout_seconds,
+    )
+    if ext_resp is None:
+        print(f"[pdf-converter] external service unavailable: {call_error}")
+        return _error(502, call_error, origin)
+
+    print(f"[pdf-converter] external response status: {ext_resp.status}")
+
+    try:
+        result_text = await ext_resp.text()
+    except Exception as exc:
+        print(f"[pdf-converter] invalid response from convert service: {exc}")
+        return _error(502, "Convert service returned invalid response.", origin)
+
+    # Build a passthrough response: preserve status and Content-Type when possible
+    resp = Response.new(result_text, {"status": ext_resp.status})
+    try:
+        ct = ext_resp.headers.get("Content-Type") or ext_resp.headers.get("content-type")
+        if ct:
+            resp.headers.set("Content-Type", ct)
+    except Exception:
+        pass
+
+    if origin:
+        _set_cors_headers(resp, origin)
+
+    return resp
 
 
 
@@ -300,6 +446,10 @@ async def _handle_pdf_merger(request, env, origin: str) -> Response:
 
     if not isinstance(body, dict):
         return _error(400, "Request body must be a JSON object.", origin)
+
+    object_keys = body.get("objectKeys")
+    if not object_keys:
+        return _error(400, "Missing required field: objectKeys.", origin)
 
     merge_url = getattr(env, "SERVICE_PDF_MERGE_URL", None)
     if not merge_url:
@@ -396,6 +546,11 @@ class Default(WorkerEntrypoint):
         if path == "/api/v1/pdf-compressor":
             if method == "POST":
                 return await _handle_pdf_compressor(request, env, origin)
+            return _error(405, "Method Not Allowed: use POST.", origin)
+
+        if path == "/api/v1/pdf-converter":
+            if method == "POST":
+                return await _handle_pdf_converter(request, env, origin)
             return _error(405, "Method Not Allowed: use POST.", origin)
 
         if path == "/api/v1/pdf-merger":
