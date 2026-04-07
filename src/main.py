@@ -9,7 +9,7 @@ import asyncio
 import json
 import time
 from urllib.parse import urlparse
-from js import AbortController, Object, Response, clearTimeout, fetch as js_fetch, setTimeout
+from js import AbortController, Object, clearTimeout, fetch as js_fetch, setTimeout
 from pyodide.ffi import to_js
 
 # ---------------------------------------------------------------------------
@@ -29,21 +29,20 @@ DEFAULT_COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS = 30
 DEFAULT_MERGED_PDF_FETCH_TIMEOUT_SECONDS = 30
 MAX_RETRY_DELAY_SECONDS = 5
 
-def _set_cors_headers(resp, origin: str):
-    resp.headers.set("Access-Control-Allow-Origin", origin)
-    resp.headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    resp.headers.set("Access-Control-Allow-Headers", "Content-Type")
-    resp.headers.set("Vary", "Origin")
+def _cors_headers(origin: str) -> dict:
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Vary": "Origin",
+    }
 
 
-def _json_response(data: dict, status: int = 200, origin: str = "") -> Response:
-    # Response.new(body) always creates 200; clone with new status when needed.
-    init = {"status": status}
-    resp = Response.new(json.dumps(data), init)
-    resp.headers.set("Content-Type", "application/json")
+def _json_response(data, status: int = 200, origin: str = "") -> Response:
+    headers = {"Content-Type": "application/json"}
     if origin:
-        _set_cors_headers(resp, origin)
-    return resp
+        headers.update(_cors_headers(origin))
+    return Response(json.dumps(data), status=status, headers=headers)
 
 
 def _error(status: int, message: str, origin: str = "") -> Response:
@@ -493,8 +492,50 @@ async def _handle_pdf_merger(request, env, origin: str) -> Response:
 
 
 # ---------------------------------------------------------------------------
+# Blog handlers (D1)
+# ---------------------------------------------------------------------------
+
+async def _handle_blogs_list(env, origin: str) -> Response:
+    db = getattr(env, "DB", None)
+    if db is None:
+        return _error(500, "Database binding is not configured.", origin)
+    try:
+        result = await db.prepare(
+            "SELECT slug, title, description, thumbnail FROM blogs ORDER BY id"
+        ).all()
+        blogs = result.results.to_py()
+        try:
+            print(f"[blogs] fetched {len(blogs)} rows")
+            if len(blogs) > 0:
+                print(f"[blogs] first row keys: {list(blogs[0].keys())}")
+        except Exception:
+            print("[blogs] fetched rows (unable to show length)")
+    except Exception as exc:
+        print(f"[blogs] DB error: {exc}")
+        return _error(500, "Failed to fetch blogs.", origin)
+    return _json_response(blogs, 200, origin)
+
+
+async def _handle_blog_by_slug(slug: str, env, origin: str) -> Response:
+    db = getattr(env, "DB", None)
+    if db is None:
+        return _error(500, "Database binding is not configured.", origin)
+    try:
+        row = await db.prepare(
+            "SELECT slug, title, content FROM blogs WHERE slug = ?1"
+        ).bind(slug).first()
+    except Exception as exc:
+        print(f"[blogs] DB error: {exc}")
+        return _error(500, "Failed to fetch blog.", origin)
+    if row is None:
+        return _error(404, "Blog not found.", origin)
+    return _json_response(row.to_py(), 200, origin)
+
+
+# ---------------------------------------------------------------------------
 # Health-check (keep-alive ping)
 # ---------------------------------------------------------------------------
+
 async def _run_health_check(env):
     hello_url = getattr(env, "SERVICE_HELLO_URL", None)
     print(f"[health-check] SERVICE_HELLO_URL resolved to: {hello_url!r}")
@@ -557,6 +598,18 @@ class Default(WorkerEntrypoint):
             if method == "POST":
                 return await _handle_pdf_merger(request, env, origin)
             return _error(405, "Method Not Allowed: use POST.", origin)
+
+        if path == "/api/v1/blogs":
+            if method == "GET":
+                return await _handle_blogs_list(env, origin)
+            return _error(405, "Method Not Allowed: use GET.", origin)
+
+        if path.startswith("/api/v1/blogs/"):
+            slug = path[len("/api/v1/blogs/"):]
+            if slug:
+                if method == "GET":
+                    return await _handle_blog_by_slug(slug, env, origin)
+                return _error(405, "Method Not Allowed: use GET.", origin)
 
         return _error(404, "Not Found.", origin)
 
