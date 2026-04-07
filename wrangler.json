@@ -4,6 +4,13 @@
   "compatibility_date": "2024-12-18",
   "compatibility_flags": ["python_workers"],
   "port": 8788,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "thrj-blogs-dev",
+      "database_id": "72ef27fc-f1e1-4f7b-a673-09f27d8dc7ce"
+    }
+  ],
   "triggers": {
     "crons": ["*/30 * * * *"]
   },
