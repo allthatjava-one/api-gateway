@@ -9,6 +9,7 @@ import asyncio
 import json
 import time
 from urllib.parse import urlparse
+import fnmatch
 from js import AbortController, Object, clearTimeout, fetch as js_fetch, setTimeout
 from pyodide.ffi import to_js
 
@@ -209,7 +210,7 @@ async def _fetch_convert_with_timeout(
 
 def _handle_preflight(request, allowed_origins: list) -> Response:
     origin = request.headers.get("Origin") or ""
-    if origin not in allowed_origins:
+    if not _origin_is_allowed(origin, allowed_origins):
         return Response.new("Forbidden", {"status": 403})
     resp = Response.new("", {"status": 204})
     resp.headers.set("Access-Control-Allow-Origin", origin)
@@ -218,6 +219,39 @@ def _handle_preflight(request, allowed_origins: list) -> Response:
     resp.headers.set("Access-Control-Max-Age", "86400")
     resp.headers.set("Vary", "Origin")
     return resp
+
+
+def _origin_is_allowed(origin: str, allowed_patterns: list) -> bool:
+    """Return True if the request origin matches any allowed pattern.
+
+    Allowed patterns may include shell-style wildcards (e.g. https://*.example.com/*)
+    or a single "*" to allow any origin. Path components in patterns are ignored
+    since CORS origins do not include paths.
+    """
+    if not origin:
+        return False
+    origin_norm = origin.rstrip("/")
+    for pat in allowed_patterns:
+        p = (pat or "").strip()
+        if not p:
+            continue
+        if p == "*":
+            return True
+        # Strip any path from the pattern; we only match scheme://netloc
+        try:
+            parsed = urlparse(p)
+            if parsed.scheme and parsed.netloc:
+                pattern_origin = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+            else:
+                # pattern may be just a host pattern like "*.example.com"
+                pattern_origin = p.split("/", 1)[0].rstrip("/")
+        except Exception:
+            pattern_origin = p.split("/", 1)[0].rstrip("/")
+
+        if fnmatch.fnmatchcase(origin_norm, pattern_origin):
+            return True
+
+    return False
 
 
 # (R2 access removed) Use external compress service instead
@@ -574,7 +608,7 @@ class Default(WorkerEntrypoint):
 
         # Origin check — all non-preflight requests must come from an allowed origin
         origin = request.headers.get("Origin") or ""
-        if origin not in allowed_origins:
+        if not _origin_is_allowed(origin, allowed_origins):
             return _error(403, "Forbidden: Origin not allowed.")
 
         path = urlparse(str(request.url)).path.rstrip("/")
