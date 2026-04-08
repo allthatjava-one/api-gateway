@@ -11,6 +11,17 @@
       "database_id": "72ef27fc-f1e1-4f7b-a673-09f27d8dc7ce"
     }
   ],
+  "env": {
+    "production": {
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "thrj-blogs",
+          "database_id": "6d73e553-f1dc-42f2-a5b8-27f4cc9d8622"
+        }
+      ]
+    }
+  },
   "triggers": {
     "crons": ["*/30 * * * *"]
   },
