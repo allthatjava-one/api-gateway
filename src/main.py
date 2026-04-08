@@ -382,19 +382,19 @@ async def _handle_pdf_converter(request, env, origin: str) -> Response:
         return _error(502, "Convert service returned invalid response.", origin)
 
     # Build a passthrough response: preserve status and Content-Type when possible
-    resp = Response(result_text, status=ext_resp.status)
+    # Headers must be passed at construction time — they are immutable afterwards.
+    headers = {}
     try:
         ct = ext_resp.headers.get("Content-Type") or ext_resp.headers.get("content-type")
         if ct:
-            resp.headers["Content-Type"] = ct
+            headers["Content-Type"] = ct
     except Exception:
         pass
 
     if origin:
-        for key, value in _cors_headers(origin).items():
-            resp.headers[key] = value
+        headers.update(_cors_headers(origin))
 
-    return resp
+    return Response(result_text, status=ext_resp.status, headers=headers)
 
 
 
