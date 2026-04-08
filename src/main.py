@@ -9,7 +9,8 @@ import asyncio
 import json
 import time
 from urllib.parse import urlparse
-from js import AbortController, Object, Response, clearTimeout, fetch as js_fetch, setTimeout
+import fnmatch
+from js import AbortController, Object, clearTimeout, fetch as js_fetch, setTimeout
 from pyodide.ffi import to_js
 
 # ---------------------------------------------------------------------------
@@ -29,21 +30,20 @@ DEFAULT_COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS = 30
 DEFAULT_MERGED_PDF_FETCH_TIMEOUT_SECONDS = 30
 MAX_RETRY_DELAY_SECONDS = 5
 
-def _set_cors_headers(resp, origin: str):
-    resp.headers.set("Access-Control-Allow-Origin", origin)
-    resp.headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    resp.headers.set("Access-Control-Allow-Headers", "Content-Type")
-    resp.headers.set("Vary", "Origin")
+def _cors_headers(origin: str) -> dict:
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Vary": "Origin",
+    }
 
 
-def _json_response(data: dict, status: int = 200, origin: str = "") -> Response:
-    # Response.new(body) always creates 200; clone with new status when needed.
-    init = {"status": status}
-    resp = Response.new(json.dumps(data), init)
-    resp.headers.set("Content-Type", "application/json")
+def _json_response(data, status: int = 200, origin: str = "") -> Response:
+    headers = {"Content-Type": "application/json"}
     if origin:
-        _set_cors_headers(resp, origin)
-    return resp
+        headers.update(_cors_headers(origin))
+    return Response(json.dumps(data), status=status, headers=headers)
 
 
 def _error(status: int, message: str, origin: str = "") -> Response:
@@ -210,15 +210,50 @@ async def _fetch_convert_with_timeout(
 
 def _handle_preflight(request, allowed_origins: list) -> Response:
     origin = request.headers.get("Origin") or ""
-    if origin not in allowed_origins:
-        return Response.new("Forbidden", {"status": 403})
-    resp = Response.new("", {"status": 204})
-    resp.headers.set("Access-Control-Allow-Origin", origin)
-    resp.headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    resp.headers.set("Access-Control-Allow-Headers", "Content-Type")
-    resp.headers.set("Access-Control-Max-Age", "86400")
-    resp.headers.set("Vary", "Origin")
-    return resp
+    if not _origin_is_allowed(origin, allowed_origins):
+        print(f"[cors] preflight rejected origin={origin!r} allowed={allowed_origins!r}")
+        return Response("Forbidden", status=403)
+    headers = {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Max-Age": "86400",
+        "Vary": "Origin",
+    }
+    return Response(None, status=204, headers=headers)
+
+
+def _origin_is_allowed(origin: str, allowed_patterns: list) -> bool:
+    """Return True if the request origin matches any allowed pattern.
+
+    Allowed patterns may include shell-style wildcards (e.g. https://*.example.com/*)
+    or a single "*" to allow any origin. Path components in patterns are ignored
+    since CORS origins do not include paths.
+    """
+    if not origin:
+        return False
+    origin_norm = origin.rstrip("/")
+    for pat in allowed_patterns:
+        p = (pat or "").strip()
+        if not p:
+            continue
+        if p == "*":
+            return True
+        # Strip any path from the pattern; we only match scheme://netloc
+        try:
+            parsed = urlparse(p)
+            if parsed.scheme and parsed.netloc:
+                pattern_origin = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+            else:
+                # pattern may be just a host pattern like "*.example.com"
+                pattern_origin = p.split("/", 1)[0].rstrip("/")
+        except Exception:
+            pattern_origin = p.split("/", 1)[0].rstrip("/")
+
+        if fnmatch.fnmatchcase(origin_norm, pattern_origin):
+            return True
+
+    return False
 
 
 # (R2 access removed) Use external compress service instead
@@ -251,6 +286,10 @@ async def _handle_pdf_compressor(request, env, origin: str) -> Response:
     # Call external compress service which returns a presigned key
     # external_url = "http://localhost:8787/compress"
     external_url = env.SERVICE_PDF_COMPRESS_URL
+    # print(
+    #     f"[pdf-compressor] external_url resolved to: {external_url}"
+    # )
+
 
     compressed_pdf_fetch_timeout_seconds = DEFAULT_COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS
     fetch_timeout_raw = getattr(env, "COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS", None)
@@ -343,11 +382,11 @@ async def _handle_pdf_converter(request, env, origin: str) -> Response:
         return _error(502, "Convert service returned invalid response.", origin)
 
     # Build a passthrough response: preserve status and Content-Type when possible
-    resp = Response.new(result_text, {"status": ext_resp.status})
+    resp = Response(result_text, status=ext_resp.status)
     try:
         ct = ext_resp.headers.get("Content-Type") or ext_resp.headers.get("content-type")
         if ct:
-            resp.headers.set("Content-Type", ct)
+            resp.headers["Content-Type"] = ct
     except Exception:
         pass
 
@@ -493,8 +532,50 @@ async def _handle_pdf_merger(request, env, origin: str) -> Response:
 
 
 # ---------------------------------------------------------------------------
+# Blog handlers (D1)
+# ---------------------------------------------------------------------------
+
+async def _handle_blogs_list(env, origin: str) -> Response:
+    db = getattr(env, "DB", None)
+    if db is None:
+        return _error(500, "Database binding is not configured.", origin)
+    try:
+        result = await db.prepare(
+            "SELECT slug, title, description, thumbnail FROM blogs ORDER BY id"
+        ).all()
+        blogs = result.results.to_py()
+        try:
+            print(f"[blogs] fetched {len(blogs)} rows")
+            if len(blogs) > 0:
+                print(f"[blogs] first row keys: {list(blogs[0].keys())}")
+        except Exception:
+            print("[blogs] fetched rows (unable to show length)")
+    except Exception as exc:
+        print(f"[blogs] DB error: {exc}")
+        return _error(500, "Failed to fetch blogs.", origin)
+    return _json_response(blogs, 200, origin)
+
+
+async def _handle_blog_by_slug(slug: str, env, origin: str) -> Response:
+    db = getattr(env, "DB", None)
+    if db is None:
+        return _error(500, "Database binding is not configured.", origin)
+    try:
+        row = await db.prepare(
+            "SELECT slug, title, content FROM blogs WHERE slug = ?1"
+        ).bind(slug).first()
+    except Exception as exc:
+        print(f"[blogs] DB error: {exc}")
+        return _error(500, "Failed to fetch blog.", origin)
+    if row is None:
+        return _error(404, "Blog not found.", origin)
+    return _json_response(row.to_py(), 200, origin)
+
+
+# ---------------------------------------------------------------------------
 # Health-check (keep-alive ping)
 # ---------------------------------------------------------------------------
+
 async def _run_health_check(env):
     hello_url = getattr(env, "SERVICE_HELLO_URL", None)
     print(f"[health-check] SERVICE_HELLO_URL resolved to: {hello_url!r}")
@@ -518,6 +599,12 @@ class Default(WorkerEntrypoint):
 
         raw = getattr(env, "ALLOWED_ORIGINS", "") or ""
         allowed_origins = [o.strip() for o in raw.split(",") if o.strip()]
+        # Debug: log origin/method/path and configured allowed origins
+        try:
+            incoming_origin = request.headers.get("Origin") or ""
+        except Exception:
+            incoming_origin = ""
+        print(f"[cors] incoming origin={incoming_origin!r} allowed={allowed_origins!r} method={method} path={urlparse(str(request.url)).path}")
 
         # Scheduled-trigger shim: wrangler dev routes /__scheduled through on_fetch
         # for Python workers instead of calling the scheduled handler directly.
@@ -533,8 +620,16 @@ class Default(WorkerEntrypoint):
 
         # Origin check — all non-preflight requests must come from an allowed origin
         origin = request.headers.get("Origin") or ""
-        if origin not in allowed_origins:
-            return _error(403, "Forbidden: Origin not allowed.")
+        # Enforce stricter rules: require Origin for non-safe methods.
+        # Allow empty Origin only for safe, idempotent requests (GET, HEAD, OPTIONS).
+        if not origin:
+            if method not in ("GET", "HEAD", "OPTIONS"):
+                print(f"[cors] missing Origin rejected method={method} path={urlparse(str(request.url)).path}")
+                return _error(403, "Forbidden: Origin header required for this method.")
+        else:
+            if not _origin_is_allowed(origin, allowed_origins):
+                print(f"[cors] request rejected origin={origin!r} allowed={allowed_origins!r}")
+                return _error(403, "Forbidden: Origin not allowed.")
 
         path = urlparse(str(request.url)).path.rstrip("/")
 
@@ -557,6 +652,18 @@ class Default(WorkerEntrypoint):
             if method == "POST":
                 return await _handle_pdf_merger(request, env, origin)
             return _error(405, "Method Not Allowed: use POST.", origin)
+
+        if path == "/api/v1/blogs":
+            if method == "GET":
+                return await _handle_blogs_list(env, origin)
+            return _error(405, "Method Not Allowed: use GET.", origin)
+
+        if path.startswith("/api/v1/blogs/"):
+            slug = path[len("/api/v1/blogs/"):]
+            if slug:
+                if method == "GET":
+                    return await _handle_blog_by_slug(slug, env, origin)
+                return _error(405, "Method Not Allowed: use GET.", origin)
 
         return _error(404, "Not Found.", origin)
 

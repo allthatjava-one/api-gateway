@@ -17,6 +17,8 @@ uv run pywrangler init
 # Start the app in local
 ```
 wrangler dev --port 8788
+# with remote database
+npx wrangler dev --port 8788 --remote
 ```
 
 # Trigger the scheduled health-check job manually (local dev only)
@@ -28,6 +30,7 @@ curl "http://localhost:8788/__scheduled"
 # Deploy to Cloudflare Pages
 Keep all variables as secret type
 ```
-> Deploy command:npx wrangler deploy --keep-vars
+> Build command: npx wrangler deploy --keep-vars
+> Deploy command: npx wrangler deploy --keep-vars
 > Put Non-production branch deployment command as : npx wrangler versions upload
 ```
