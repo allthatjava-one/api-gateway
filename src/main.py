@@ -213,13 +213,14 @@ def _handle_preflight(request, allowed_origins: list) -> Response:
     if not _origin_is_allowed(origin, allowed_origins):
         print(f"[cors] preflight rejected origin={origin!r} allowed={allowed_origins!r}")
         return Response("Forbidden", status=403)
-    resp = Response("", status=204)
-    resp.headers.set("Access-Control-Allow-Origin", origin)
-    resp.headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-    resp.headers.set("Access-Control-Allow-Headers", "Content-Type")
-    resp.headers.set("Access-Control-Max-Age", "86400")
-    resp.headers.set("Vary", "Origin")
-    return resp
+    headers = {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Max-Age": "86400",
+        "Vary": "Origin",
+    }
+    return Response(None, status=204, headers=headers)
 
 
 def _origin_is_allowed(origin: str, allowed_patterns: list) -> bool:
@@ -285,6 +286,10 @@ async def _handle_pdf_compressor(request, env, origin: str) -> Response:
     # Call external compress service which returns a presigned key
     # external_url = "http://localhost:8787/compress"
     external_url = env.SERVICE_PDF_COMPRESS_URL
+    # print(
+    #     f"[pdf-compressor] external_url resolved to: {external_url}"
+    # )
+
 
     compressed_pdf_fetch_timeout_seconds = DEFAULT_COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS
     fetch_timeout_raw = getattr(env, "COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS", None)
@@ -381,7 +386,7 @@ async def _handle_pdf_converter(request, env, origin: str) -> Response:
     try:
         ct = ext_resp.headers.get("Content-Type") or ext_resp.headers.get("content-type")
         if ct:
-            resp.headers.set("Content-Type", ct)
+            resp.headers["Content-Type"] = ct
     except Exception:
         pass
 
