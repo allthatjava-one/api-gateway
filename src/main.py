@@ -211,6 +211,7 @@ async def _fetch_convert_with_timeout(
 def _handle_preflight(request, allowed_origins: list) -> Response:
     origin = request.headers.get("Origin") or ""
     if not _origin_is_allowed(origin, allowed_origins):
+        print(f"[cors] preflight rejected origin={origin!r} allowed={allowed_origins!r}")
         return Response.new("Forbidden", {"status": 403})
     resp = Response.new("", {"status": 204})
     resp.headers.set("Access-Control-Allow-Origin", origin)
@@ -593,6 +594,12 @@ class Default(WorkerEntrypoint):
 
         raw = getattr(env, "ALLOWED_ORIGINS", "") or ""
         allowed_origins = [o.strip() for o in raw.split(",") if o.strip()]
+        # Debug: log origin/method/path and configured allowed origins
+        try:
+            incoming_origin = request.headers.get("Origin") or ""
+        except Exception:
+            incoming_origin = ""
+        print(f"[cors] incoming origin={incoming_origin!r} allowed={allowed_origins!r} method={method} path={urlparse(str(request.url)).path}")
 
         # Scheduled-trigger shim: wrangler dev routes /__scheduled through on_fetch
         # for Python workers instead of calling the scheduled handler directly.
@@ -608,8 +615,16 @@ class Default(WorkerEntrypoint):
 
         # Origin check — all non-preflight requests must come from an allowed origin
         origin = request.headers.get("Origin") or ""
-        if not _origin_is_allowed(origin, allowed_origins):
-            return _error(403, "Forbidden: Origin not allowed.")
+        # Enforce stricter rules: require Origin for non-safe methods.
+        # Allow empty Origin only for safe, idempotent requests (GET, HEAD, OPTIONS).
+        if not origin:
+            if method not in ("GET", "HEAD", "OPTIONS"):
+                print(f"[cors] missing Origin rejected method={method} path={urlparse(str(request.url)).path}")
+                return _error(403, "Forbidden: Origin header required for this method.")
+        else:
+            if not _origin_is_allowed(origin, allowed_origins):
+                print(f"[cors] request rejected origin={origin!r} allowed={allowed_origins!r}")
+                return _error(403, "Forbidden: Origin not allowed.")
 
         path = urlparse(str(request.url)).path.rstrip("/")
 
