@@ -212,8 +212,8 @@ def _handle_preflight(request, allowed_origins: list) -> Response:
     origin = request.headers.get("Origin") or ""
     if not _origin_is_allowed(origin, allowed_origins):
         print(f"[cors] preflight rejected origin={origin!r} allowed={allowed_origins!r}")
-        return Response.new("Forbidden", {"status": 403})
-    resp = Response.new("", {"status": 204})
+        return Response("Forbidden", status=403)
+    resp = Response("", status=204)
     resp.headers.set("Access-Control-Allow-Origin", origin)
     resp.headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
     resp.headers.set("Access-Control-Allow-Headers", "Content-Type")
@@ -377,7 +377,7 @@ async def _handle_pdf_converter(request, env, origin: str) -> Response:
         return _error(502, "Convert service returned invalid response.", origin)
 
     # Build a passthrough response: preserve status and Content-Type when possible
-    resp = Response.new(result_text, {"status": ext_resp.status})
+    resp = Response(result_text, status=ext_resp.status)
     try:
         ct = ext_resp.headers.get("Content-Type") or ext_resp.headers.get("content-type")
         if ct:
