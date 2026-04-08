@@ -391,7 +391,8 @@ async def _handle_pdf_converter(request, env, origin: str) -> Response:
         pass
 
     if origin:
-        _set_cors_headers(resp, origin)
+        for key, value in _cors_headers(origin).items():
+            resp.headers[key] = value
 
     return resp
 
