@@ -30,6 +30,8 @@ DEFAULT_COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS = 30
 DEFAULT_MERGED_PDF_FETCH_TIMEOUT_SECONDS = 30
 MAX_RETRY_DELAY_SECONDS = 5
 
+_blogs_cache: dict = {"data": None}
+
 def _cors_headers(origin: str) -> dict:
     return {
         "Access-Control-Allow-Origin": origin,
@@ -537,6 +539,10 @@ async def _handle_pdf_merger(request, env, origin: str) -> Response:
 # ---------------------------------------------------------------------------
 
 async def _handle_blogs_list(env, origin: str) -> Response:
+    if _blogs_cache["data"] is not None:
+        print("[blogs] serving from cache")
+        return _json_response(_blogs_cache["data"], 200, origin)
+
     db = getattr(env, "DB", None)
     if db is None:
         return _error(500, "Database binding is not configured.", origin)
@@ -554,6 +560,9 @@ async def _handle_blogs_list(env, origin: str) -> Response:
     except Exception as exc:
         print(f"[blogs] DB error: {exc}")
         return _error(500, "Failed to fetch blogs.", origin)
+
+    _blogs_cache["data"] = blogs
+
     return _json_response(blogs, 200, origin)
 
 
