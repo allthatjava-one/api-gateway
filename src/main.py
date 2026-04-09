@@ -582,6 +582,47 @@ async def _handle_blog_by_slug(slug: str, env, origin: str) -> Response:
     return _json_response(row.to_py(), 200, origin)
 
 
+async def _handle_blogs_evict(request, env, origin: str) -> Response:
+    """Evict the cached blog list so future requests fetch fresh data.
+
+    Requires a matching `evicPass` parameter (JSON body field or query
+    parameter) that equals the `EVICTION_PASSWORD` environment variable.
+    """
+    expected = getattr(env, "EVICTION_PASSWORD", None)
+    if not expected:
+        return _error(500, "Missing required environment variable: EVICTION_PASSWORD.", origin)
+
+    evic_pass = None
+    # Prefer JSON body
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            evic_pass = body.get("evicPass")
+    except Exception:
+        body = None
+
+    # Fallback to query parameter if not provided in body
+    if not evic_pass:
+        try:
+            qs = urlparse(str(request.url)).query
+            from urllib.parse import parse_qs
+
+            q = parse_qs(qs)
+            vals = q.get("evicPass") or q.get("evictPass")
+            if vals:
+                evic_pass = vals[0]
+        except Exception:
+            evic_pass = None
+
+    if evic_pass is None or str(evic_pass) != str(expected):
+        print(f"[blogs] eviction denied; provided={evic_pass!r}")
+        return _error(403, "Forbidden: invalid eviction password.", origin)
+
+    _blogs_cache["data"] = None
+    print("[blogs] cache evicted")
+    return _json_response({"evicted": True}, 200, origin)
+
+
 # ---------------------------------------------------------------------------
 # Health-check (keep-alive ping)
 # ---------------------------------------------------------------------------
@@ -667,6 +708,11 @@ class Default(WorkerEntrypoint):
             if method == "GET":
                 return await _handle_blogs_list(env, origin)
             return _error(405, "Method Not Allowed: use GET.", origin)
+
+        if path == "/api/v1/blogs/evict":
+            if method == "POST":
+                return await _handle_blogs_evict(request, env, origin)
+            return _error(405, "Method Not Allowed: use POST.", origin)
 
         if path.startswith("/api/v1/blogs/"):
             slug = path[len("/api/v1/blogs/"):]
