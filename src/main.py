@@ -30,7 +30,8 @@ DEFAULT_COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS = 30
 DEFAULT_MERGED_PDF_FETCH_TIMEOUT_SECONDS = 30
 MAX_RETRY_DELAY_SECONDS = 5
 
-_blogs_cache: dict = {"data": None}
+from cache.blogs_cache import get_cached_blogs, set_cached_blogs, evict_cached_blogs
+from db.blogs_db import get_blogs, get_blog_by_slug
 
 def _cors_headers(origin: str) -> dict:
     return {
@@ -539,29 +540,20 @@ async def _handle_pdf_merger(request, env, origin: str) -> Response:
 # ---------------------------------------------------------------------------
 
 async def _handle_blogs_list(env, origin: str) -> Response:
-    if _blogs_cache["data"] is not None:
-        print("[blogs] serving from cache")
-        return _json_response(_blogs_cache["data"], 200, origin)
+    cached = await get_cached_blogs()
+    if cached is not None:
+        return _json_response(cached, 200, origin)
 
     db = getattr(env, "DB", None)
     if db is None:
         return _error(500, "Database binding is not configured.", origin)
     try:
-        result = await db.prepare(
-            "SELECT slug, title, description, thumbnail FROM blogs ORDER BY id"
-        ).all()
-        blogs = result.results.to_py()
-        try:
-            print(f"[blogs] fetched {len(blogs)} rows")
-            if len(blogs) > 0:
-                print(f"[blogs] first row keys: {list(blogs[0].keys())}")
-        except Exception:
-            print("[blogs] fetched rows (unable to show length)")
+        blogs = await get_blogs(db)
     except Exception as exc:
         print(f"[blogs] DB error: {exc}")
         return _error(500, "Failed to fetch blogs.", origin)
 
-    _blogs_cache["data"] = blogs
+    await set_cached_blogs(blogs)
 
     return _json_response(blogs, 200, origin)
 
@@ -571,15 +563,13 @@ async def _handle_blog_by_slug(slug: str, env, origin: str) -> Response:
     if db is None:
         return _error(500, "Database binding is not configured.", origin)
     try:
-        row = await db.prepare(
-            "SELECT slug, title, content FROM blogs WHERE slug = ?1"
-        ).bind(slug).first()
+        row = await get_blog_by_slug(db, slug)
     except Exception as exc:
         print(f"[blogs] DB error: {exc}")
         return _error(500, "Failed to fetch blog.", origin)
     if row is None:
         return _error(404, "Blog not found.", origin)
-    return _json_response(row.to_py(), 200, origin)
+    return _json_response(row, 200, origin)
 
 
 async def _handle_blogs_evict(request, env, origin: str) -> Response:
@@ -618,8 +608,7 @@ async def _handle_blogs_evict(request, env, origin: str) -> Response:
         print(f"[blogs] eviction denied; provided={evic_pass!r}")
         return _error(403, "Forbidden: invalid eviction password.", origin)
 
-    _blogs_cache["data"] = None
-    print("[blogs] cache evicted")
+    await evict_cached_blogs()
     return _json_response({"evicted": True}, 200, origin)
 
 
