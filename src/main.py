@@ -55,7 +55,7 @@ def _error(status: int, message: str, origin: str = "") -> Response:
 
 async def _call_compress_service_with_retry(
     external_url: str,
-    object_key: str,
+    request_body: str,
     compressed_pdf_fetch_timeout_seconds: float,
 ):
     deadline = time.monotonic() + MAX_COMPRESS_WAIT_SECONDS
@@ -67,7 +67,7 @@ async def _call_compress_service_with_retry(
         attempt += 1
         ext_resp, fetch_error = await _fetch_compress_with_timeout(
             external_url,
-            object_key,
+            request_body,
             compressed_pdf_fetch_timeout_seconds,
         )
         if ext_resp is None:
@@ -101,7 +101,7 @@ async def _call_compress_service_with_retry(
 
 async def _fetch_compress_with_timeout(
     external_url: str,
-    object_key: str,
+    request_body: str,
     compressed_pdf_fetch_timeout_seconds: float,
 ):
     controller = AbortController.new()
@@ -115,7 +115,7 @@ async def _fetch_compress_with_timeout(
                 {
                     "method": "POST",
                     "headers": {"Content-Type": "application/json"},
-                    "body": json.dumps({"objectKey": object_key}),
+                    "body": json.dumps(request_body),
                     "signal": controller.signal,
                 },
                 dict_converter=Object.fromEntries,
@@ -273,14 +273,14 @@ def _handle_hello(origin: str) -> Response:
 async def _handle_pdf_compressor(request, env, origin: str) -> Response:
     # Parse body
     try:
-        body = await request.json()
+        request_body = await request.json()
     except Exception:
         return _error(400, "Request body must be valid JSON.", origin)
 
-    if not isinstance(body, dict):
+    if not isinstance(request_body, dict):
         return _error(400, "Request body must be a JSON object.", origin)
 
-    object_key = body.get("objectKey")
+    object_key = request_body.get("objectKey")
     if not object_key:
         return _error(400, "Missing required field: objectKey.", origin)
 
@@ -309,7 +309,7 @@ async def _handle_pdf_compressor(request, env, origin: str) -> Response:
     print(f"[pdf-compressor] calling external compress service for: {object_key}")
     ext_resp, call_error = await _call_compress_service_with_retry(
         external_url,
-        object_key,
+        request_body,
         compressed_pdf_fetch_timeout_seconds,
     )
     if ext_resp is None:
@@ -540,7 +540,8 @@ async def _handle_pdf_merger(request, env, origin: str) -> Response:
 # ---------------------------------------------------------------------------
 
 async def _handle_blogs_list(env, origin: str) -> Response:
-    cached = await get_cached_blogs()
+    app_env = getattr(env, "APP_ENV", "development")
+    cached = await get_cached_blogs(app_env)
     if cached is not None:
         return _json_response(cached, 200, origin)
 
@@ -553,7 +554,7 @@ async def _handle_blogs_list(env, origin: str) -> Response:
         print(f"[blogs] DB error: {exc}")
         return _error(500, "Failed to fetch blogs.", origin)
 
-    await set_cached_blogs(blogs)
+    await set_cached_blogs(app_env, blogs)
 
     return _json_response(blogs, 200, origin)
 
@@ -608,7 +609,8 @@ async def _handle_blogs_evict(request, env, origin: str) -> Response:
         print(f"[blogs] eviction denied; provided={evic_pass!r}")
         return _error(403, "Forbidden: invalid eviction password.", origin)
 
-    await evict_cached_blogs()
+    app_env = getattr(env, "APP_ENV", "development")
+    await evict_cached_blogs(app_env)
     return _json_response({"evicted": True}, 200, origin)
 
 
