@@ -540,7 +540,8 @@ async def _handle_pdf_merger(request, env, origin: str) -> Response:
 # ---------------------------------------------------------------------------
 
 async def _handle_blogs_list(env, origin: str) -> Response:
-    cached = await get_cached_blogs()
+    app_env = getattr(env, "APP_ENV", "development")
+    cached = await get_cached_blogs(app_env)
     if cached is not None:
         return _json_response(cached, 200, origin)
 
@@ -553,7 +554,7 @@ async def _handle_blogs_list(env, origin: str) -> Response:
         print(f"[blogs] DB error: {exc}")
         return _error(500, "Failed to fetch blogs.", origin)
 
-    await set_cached_blogs(blogs)
+    await set_cached_blogs(app_env, blogs)
 
     return _json_response(blogs, 200, origin)
 
@@ -608,7 +609,8 @@ async def _handle_blogs_evict(request, env, origin: str) -> Response:
         print(f"[blogs] eviction denied; provided={evic_pass!r}")
         return _error(403, "Forbidden: invalid eviction password.", origin)
 
-    await evict_cached_blogs()
+    app_env = getattr(env, "APP_ENV", "development")
+    await evict_cached_blogs(app_env)
     return _json_response({"evicted": True}, 200, origin)
 
 
