@@ -31,7 +31,7 @@ DEFAULT_MERGED_PDF_FETCH_TIMEOUT_SECONDS = 30
 MAX_RETRY_DELAY_SECONDS = 5
 
 from cache.blogs_cache import get_cached_blogs, set_cached_blogs, evict_cached_blogs
-from db.blogs_db import get_blogs, get_blog_by_slug
+from db.blogs_db import get_blogs, get_blog_by_slug, count_blogs
 
 def _cors_headers(origin: str) -> dict:
     return {
@@ -539,24 +539,106 @@ async def _handle_pdf_merger(request, env, origin: str) -> Response:
 # Blog handlers (D1)
 # ---------------------------------------------------------------------------
 
-async def _handle_blogs_list(env, origin: str) -> Response:
+async def _handle_blogs_list(request, env, origin: str) -> Response:
+    """Handle GET /api/v1/blogs with optional pagination query params.
+
+    Query params: `page` (default 1), `page_size` (default 10, max 50).
+    Returns a JSON payload with `items`, `page`, `page_size`, `total`,
+    `total_pages` and `links` containing `first`/`last`/`prev`/`next` URLs.
+    """
+    # Defaults and limits
+    DEFAULT_PAGE = 1
+    DEFAULT_PAGE_SIZE = 10
+    MAX_PAGE_SIZE = 50
+
+    # Read optional query params
+    qs = urlparse(str(request.url)).query
+    from urllib.parse import parse_qs, urlencode
+
+    q = parse_qs(qs)
+    def _get_int(name, default):
+        vals = q.get(name)
+        if not vals:
+            return default, None
+        v = vals[0]
+        try:
+            return int(v), None
+        except Exception:
+            return None, f"Invalid integer for {name}: {v!r}"
+
+    page, err = _get_int("page", DEFAULT_PAGE)
+    if err:
+        return _error(400, err, origin)
+    page_size, err = _get_int("page_size", DEFAULT_PAGE_SIZE)
+    if err:
+        return _error(400, err, origin)
+
+    if page is None or page < 1:
+        return _error(400, "`page` must be >= 1.", origin)
+    if page_size is None or page_size < 1 or page_size > MAX_PAGE_SIZE:
+        return _error(400, f"`page_size` must be between 1 and {MAX_PAGE_SIZE}.", origin)
+
+    offset = (page - 1) * page_size
+
     app_env = getattr(env, "APP_ENV", "development")
-    cached = await get_cached_blogs(app_env)
+    # Try per-page cache first
+    cached = await get_cached_blogs(app_env, page, page_size)
     if cached is not None:
         return _json_response(cached, 200, origin)
 
     db = getattr(env, "DB", None)
     if db is None:
         return _error(500, "Database binding is not configured.", origin)
+
     try:
-        blogs = await get_blogs(db)
+        # Fetch exactly page_size rows
+        blogs = await get_blogs(db, limit=page_size, offset=offset)
     except Exception as exc:
         print(f"[blogs] DB error: {exc}")
         return _error(500, "Failed to fetch blogs.", origin)
 
-    await set_cached_blogs(app_env, blogs)
+    # Compute total and total_pages for frontend pagination UI
+    total = 0
+    try:
+        total = await count_blogs(db)
+    except Exception as exc:
+        print(f"[blogs] count error: {exc}")
 
-    return _json_response(blogs, 200, origin)
+    if total and total > 0:
+        total_pages = (total + page_size - 1) // page_size
+    else:
+        total_pages = 0
+
+    base_path = urlparse(str(request.url)).path.rstrip("/")
+    from urllib.parse import urlencode
+
+    def make_link(p):
+        qs = urlencode({"page": p, "page_size": page_size})
+        return f"{base_path}?{qs}"
+
+    links = {
+        "first": make_link(1) if total_pages > 0 else None,
+        "last": make_link(total_pages) if total_pages > 0 else None,
+        "prev": make_link(page - 1) if page > 1 else None,
+        "next": make_link(page + 1) if page < total_pages else None,
+    }
+
+    payload = {
+        "items": blogs,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+        "links": links,
+    }
+
+    # Cache this page
+    try:
+        await set_cached_blogs(app_env, page, page_size, payload)
+    except Exception as exc:
+        print(f"[blogs] cache set failed: {exc}")
+
+    return _json_response(payload, 200, origin)
 
 
 async def _handle_blog_by_slug(slug: str, env, origin: str) -> Response:
@@ -697,7 +779,7 @@ class Default(WorkerEntrypoint):
 
         if path == "/api/v1/blogs":
             if method == "GET":
-                return await _handle_blogs_list(env, origin)
+                return await _handle_blogs_list(request, env, origin)
             return _error(405, "Method Not Allowed: use GET.", origin)
 
         if path == "/api/v1/blogs/evict":
