@@ -13,8 +13,8 @@ async def get_blogs(db, limit: int | None = None, offset: int = 0) -> list:
         result = await db.prepare(stmt).all()
     else:
         stmt = (
-            "SELECT slug, title, description, thumbnail FROM blogs "
-            "ORDER BY id LIMIT ?1 OFFSET ?2"
+            "SELECT slug, title, description, thumbnail, createdAt FROM blogs "
+            "ORDER BY createdAt DESC LIMIT ?1 OFFSET ?2"
         )
         result = await db.prepare(stmt).bind(limit, offset).all()
     blogs = result.results.to_py()
