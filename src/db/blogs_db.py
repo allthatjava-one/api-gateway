@@ -9,7 +9,7 @@ async def get_blogs(db, limit: int | None = None, offset: int = 0) -> list:
     If `limit` is None, returns all rows.
     """
     if limit is None:
-        stmt = "SELECT slug, title, description, thumbnail FROM blogs ORDER BY id"
+        stmt = "SELECT slug, title, description, thumbnail, createdAt FROM blogs ORDER  BY createdAt DESC"
         result = await db.prepare(stmt).all()
     else:
         stmt = (
