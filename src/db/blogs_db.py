@@ -9,12 +9,12 @@ async def get_blogs(db, limit: int | None = None, offset: int = 0) -> list:
     If `limit` is None, returns all rows.
     """
     if limit is None:
-        stmt = "SELECT slug, title, description, thumbnail FROM blogs ORDER BY id"
+        stmt = "SELECT slug, title, description, thumbnail, createdAt FROM blogs ORDER  BY createdAt DESC"
         result = await db.prepare(stmt).all()
     else:
         stmt = (
-            "SELECT slug, title, description, thumbnail FROM blogs "
-            "ORDER BY id LIMIT ?1 OFFSET ?2"
+            "SELECT slug, title, description, thumbnail, createdAt FROM blogs "
+            "ORDER BY createdAt DESC LIMIT ?1 OFFSET ?2"
         )
         result = await db.prepare(stmt).bind(limit, offset).all()
     blogs = result.results.to_py()
@@ -30,7 +30,7 @@ async def get_blogs(db, limit: int | None = None, offset: int = 0) -> list:
 async def get_blog_by_slug(db, slug: str):
     """Fetch a single blog by slug. Returns a dict or None if not found."""
     row = await db.prepare(
-        "SELECT slug, title, content FROM blogs WHERE slug = ?1"
+        "SELECT slug, title, content, createdAt FROM blogs WHERE slug = ?1"
     ).bind(slug).first()
     if row is None:
         return None
