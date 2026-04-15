@@ -30,7 +30,7 @@ async def get_blogs(db, limit: int | None = None, offset: int = 0) -> list:
 async def get_blog_by_slug(db, slug: str):
     """Fetch a single blog by slug. Returns a dict or None if not found."""
     row = await db.prepare(
-        "SELECT slug, title, content FROM blogs WHERE slug = ?1"
+        "SELECT slug, title, content, createdAt FROM blogs WHERE slug = ?1"
     ).bind(slug).first()
     if row is None:
         return None
