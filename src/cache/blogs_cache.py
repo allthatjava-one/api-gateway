@@ -73,20 +73,7 @@ async def set_cached_blogs(env_name: str, page: int, page_size: int, payload):
 async def evict_cached_blogs(env_name: str):
     """Delete all cached pages for the blog list from the Cloudflare Cache API."""
     try:
-        cache = await js_caches.open(_cache_name(env_name))
-        # Iterate keys and delete any that match our prefix
-        keys = await cache.keys()
-        deleted = 0
-        prefix = f"https://api-gateway-internal-cache/{env_name}/v1/blogs"
-        for req in keys:
-            try:
-                url = getattr(req, "url", None) or str(req)
-                if url.startswith(prefix):
-                    ok = await cache.delete(req)
-                    if ok:
-                        deleted += 1
-            except Exception:
-                pass
+        deleted = await js_caches.delete(_cache_name(env_name))
         print(f"[blogs] cache evicted ({env_name}) (deleted={deleted})")
     except Exception as exc:
         print(f"[blogs] cache evict error: {exc}")
