@@ -1,7 +1,8 @@
 """
 api-gateway — Cloudflare Python Worker
 POST /api/v1/pdf-compressor
-POST /api/v1/pdf-merger
+# POST /api/v1/pdf-merger   (deprecated — feature removed)
+# POST /api/v1/pdf-splitter  (deprecated — feature removed)
 """
 from workers import WorkerEntrypoint, Response
 
@@ -27,7 +28,7 @@ TRANSIENT_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 MAX_COMPRESS_WAIT_SECONDS = 90
 DEFAULT_INITIAL_RETRY_DELAY_SECONDS = 1
 DEFAULT_COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS = 30
-DEFAULT_MERGED_PDF_FETCH_TIMEOUT_SECONDS = 30
+# DEFAULT_MERGED_PDF_FETCH_TIMEOUT_SECONDS = 30  # deprecated — pdf-merger removed
 MAX_RETRY_DELAY_SECONDS = 5
 
 from cache.blogs_cache import get_cached_blogs, set_cached_blogs, evict_cached_blogs
@@ -401,276 +402,278 @@ async def _handle_pdf_converter(request, env, origin: str) -> Response:
 
 
 
-async def _call_merge_service_with_retry(
-    merge_url: str,
-    object_keys: list,
-    merged_pdf_fetch_timeout_seconds: float,
-):
-    deadline = time.monotonic() + MAX_COMPRESS_WAIT_SECONDS
-    attempt = 0
-    retry_delay = DEFAULT_INITIAL_RETRY_DELAY_SECONDS
-    last_error = "Merge service did not become ready in time."
-
-    while time.monotonic() < deadline:
-        attempt += 1
-        ext_resp, fetch_error = await _fetch_merge_with_timeout(
-            merge_url,
-            object_keys,
-            merged_pdf_fetch_timeout_seconds,
-        )
-        if ext_resp is None:
-            last_error = fetch_error
-
-        if ext_resp is not None:
-            if ext_resp.ok:
-                return ext_resp, ""
-
-            body_text = await ext_resp.text()
-            if ext_resp.status not in TRANSIENT_STATUS_CODES:
-                return None, f"Merge service returned {ext_resp.status}: {body_text[:200]}"
-
-            last_error = (
-                f"Merge service temporary failure ({ext_resp.status}): {body_text[:200]}"
-            )
-
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-
-        sleep_for = min(retry_delay, remaining)
-        print(
-            f"[pdf-merger] attempt {attempt} failed, retrying in {sleep_for:.1f}s"
-        )
-        await asyncio.sleep(sleep_for)
-        retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY_SECONDS)
-
-    return None, last_error
-
-
-async def _fetch_merge_with_timeout(
-    merge_url: str,
-    body: dict,
-    merged_pdf_fetch_timeout_seconds: float,
-):
-    controller = AbortController.new()
-    timeout_ms = max(1, int(merged_pdf_fetch_timeout_seconds * 1000))
-    timeout_id = setTimeout(controller.abort, timeout_ms)
-
-    try:
-        ext_resp = await js_fetch(
-            merge_url,
-            to_js(
-                {
-                    "method": "POST",
-                    "headers": {"Content-Type": "application/json"},
-                    "body": json.dumps(body),
-                    "signal": controller.signal,
-                },
-                dict_converter=Object.fromEntries,
-            ),
-        )
-        return ext_resp, ""
-    except Exception as exc:
-        error_name = getattr(exc, "name", "")
-        error_text = str(exc)
-        if error_name == "AbortError" or "AbortError" in error_text:
-            return None, f"Merge service request timed out after {merged_pdf_fetch_timeout_seconds}s."
-        return None, f"Failed to call merge service: {exc}"
-    finally:
-        clearTimeout(timeout_id)
-
-
-async def _handle_pdf_merger(request, env, origin: str) -> Response:
-    # Parse body
-    try:
-        body = await request.json()
-    except Exception:
-        return _error(400, "Request body must be valid JSON.", origin)
-
-    if not isinstance(body, dict):
-        return _error(400, "Request body must be a JSON object.", origin)
-
-    object_keys = body.get("objectKeys")
-    if not object_keys:
-        return _error(400, "Missing required field: objectKeys.", origin)
-
-    merge_url = getattr(env, "SERVICE_PDF_MERGE_URL", None)
-    if not merge_url:
-        return _error(500, "Missing required environment variable: SERVICE_PDF_MERGE_URL.", origin)
-
-    merged_pdf_fetch_timeout_seconds = DEFAULT_MERGED_PDF_FETCH_TIMEOUT_SECONDS
-    fetch_timeout_raw = getattr(env, "MERGED_PDF_FETCH_TIMEOUT_SECONDS", None)
-    if fetch_timeout_raw is not None:
-        try:
-            configured_timeout = float(fetch_timeout_raw)
-            if configured_timeout > 0:
-                merged_pdf_fetch_timeout_seconds = configured_timeout
-        except (TypeError, ValueError):
-            print(
-                "[pdf-merger] invalid MERGED_PDF_FETCH_TIMEOUT_SECONDS; using default"
-            )
-
-    print(f"[pdf-merger] calling external merge service with full request body")
-    ext_resp, call_error = await _call_merge_service_with_retry(
-        merge_url,
-        body,
-        merged_pdf_fetch_timeout_seconds,
-    )
-    if ext_resp is None:
-        print(f"[pdf-merger] external service unavailable: {call_error}")
-        return _error(502, call_error, origin)
-
-    print(f"[pdf-merger] external response status: {ext_resp.status}")
-
-    try:
-        result_text = await ext_resp.text()
-        result = json.loads(result_text)
-    except Exception:
-        return _error(502, "Merge service returned invalid JSON.", origin)
-
-    presigned = result.get("presignedUrl")
-    if not presigned:
-        return _error(502, "Merge service did not return presignedUrl.", origin)
-
-    return _json_response({"presignedUrl": presigned}, 200, origin)
-
-
-async def _call_split_service_with_retry(
-    split_url: str,
-    body: dict,
-    fetch_timeout_seconds: float,
-):
-    deadline = time.monotonic() + MAX_COMPRESS_WAIT_SECONDS
-    attempt = 0
-    retry_delay = DEFAULT_INITIAL_RETRY_DELAY_SECONDS
-    last_error = "Split service did not become ready in time."
-
-    print(f"split_url:{split_url}")
-
-    while time.monotonic() < deadline:
-        attempt += 1
-        ext_resp, fetch_error = await _fetch_split_with_timeout(
-            split_url,
-            body,
-            fetch_timeout_seconds,
-        )
-        if ext_resp is None:
-            last_error = fetch_error
-
-        if ext_resp is not None:
-            if ext_resp.ok:
-                return ext_resp, ""
-
-            body_text = await ext_resp.text()
-            if ext_resp.status not in TRANSIENT_STATUS_CODES:
-                return None, f"Split service returned {ext_resp.status}: {body_text[:200]}"
-
-            last_error = (
-                f"Split service temporary failure ({ext_resp.status}): {body_text[:200]}"
-            )
-
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-
-        sleep_for = min(retry_delay, remaining)
-        print(f"[pdf-splitter] attempt {attempt} failed, retrying in {sleep_for:.1f}s")
-        await asyncio.sleep(sleep_for)
-        retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY_SECONDS)
-
-    return None, last_error
+# --- pdf-merger (deprecated — feature removed, kept for history) ---
+# async def _call_merge_service_with_retry(
+#     merge_url: str,
+#     object_keys: list,
+#     merged_pdf_fetch_timeout_seconds: float,
+# ):
+#     deadline = time.monotonic() + MAX_COMPRESS_WAIT_SECONDS
+#     attempt = 0
+#     retry_delay = DEFAULT_INITIAL_RETRY_DELAY_SECONDS
+#     last_error = "Merge service did not become ready in time."
+#
+#     while time.monotonic() < deadline:
+#         attempt += 1
+#         ext_resp, fetch_error = await _fetch_merge_with_timeout(
+#             merge_url,
+#             object_keys,
+#             merged_pdf_fetch_timeout_seconds,
+#         )
+#         if ext_resp is None:
+#             last_error = fetch_error
+#
+#         if ext_resp is not None:
+#             if ext_resp.ok:
+#                 return ext_resp, ""
+#
+#             body_text = await ext_resp.text()
+#             if ext_resp.status not in TRANSIENT_STATUS_CODES:
+#                 return None, f"Merge service returned {ext_resp.status}: {body_text[:200]}"
+#
+#             last_error = (
+#                 f"Merge service temporary failure ({ext_resp.status}): {body_text[:200]}"
+#             )
+#
+#         remaining = deadline - time.monotonic()
+#         if remaining <= 0:
+#             break
+#
+#         sleep_for = min(retry_delay, remaining)
+#         print(
+#             f"[pdf-merger] attempt {attempt} failed, retrying in {sleep_for:.1f}s"
+#         )
+#         await asyncio.sleep(sleep_for)
+#         retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY_SECONDS)
+#
+#     return None, last_error
+#
+#
+# async def _fetch_merge_with_timeout(
+#     merge_url: str,
+#     body: dict,
+#     merged_pdf_fetch_timeout_seconds: float,
+# ):
+#     controller = AbortController.new()
+#     timeout_ms = max(1, int(merged_pdf_fetch_timeout_seconds * 1000))
+#     timeout_id = setTimeout(controller.abort, timeout_ms)
+#
+#     try:
+#         ext_resp = await js_fetch(
+#             merge_url,
+#             to_js(
+#                 {
+#                     "method": "POST",
+#                     "headers": {"Content-Type": "application/json"},
+#                     "body": json.dumps(body),
+#                     "signal": controller.signal,
+#                 },
+#                 dict_converter=Object.fromEntries,
+#             ),
+#         )
+#         return ext_resp, ""
+#     except Exception as exc:
+#         error_name = getattr(exc, "name", "")
+#         error_text = str(exc)
+#         if error_name == "AbortError" or "AbortError" in error_text:
+#             return None, f"Merge service request timed out after {merged_pdf_fetch_timeout_seconds}s."
+#         return None, f"Failed to call merge service: {exc}"
+#     finally:
+#         clearTimeout(timeout_id)
+#
+#
+# async def _handle_pdf_merger(request, env, origin: str) -> Response:
+#     # Parse body
+#     try:
+#         body = await request.json()
+#     except Exception:
+#         return _error(400, "Request body must be valid JSON.", origin)
+#
+#     if not isinstance(body, dict):
+#         return _error(400, "Request body must be a JSON object.", origin)
+#
+#     object_keys = body.get("objectKeys")
+#     if not object_keys:
+#         return _error(400, "Missing required field: objectKeys.", origin)
+#
+#     merge_url = getattr(env, "SERVICE_PDF_MERGE_URL", None)
+#     if not merge_url:
+#         return _error(500, "Missing required environment variable: SERVICE_PDF_MERGE_URL.", origin)
+#
+#     merged_pdf_fetch_timeout_seconds = DEFAULT_MERGED_PDF_FETCH_TIMEOUT_SECONDS
+#     fetch_timeout_raw = getattr(env, "MERGED_PDF_FETCH_TIMEOUT_SECONDS", None)
+#     if fetch_timeout_raw is not None:
+#         try:
+#             configured_timeout = float(fetch_timeout_raw)
+#             if configured_timeout > 0:
+#                 merged_pdf_fetch_timeout_seconds = configured_timeout
+#         except (TypeError, ValueError):
+#             print(
+#                 "[pdf-merger] invalid MERGED_PDF_FETCH_TIMEOUT_SECONDS; using default"
+#             )
+#
+#     print(f"[pdf-merger] calling external merge service with full request body")
+#     ext_resp, call_error = await _call_merge_service_with_retry(
+#         merge_url,
+#         body,
+#         merged_pdf_fetch_timeout_seconds,
+#     )
+#     if ext_resp is None:
+#         print(f"[pdf-merger] external service unavailable: {call_error}")
+#         return _error(502, call_error, origin)
+#
+#     print(f"[pdf-merger] external response status: {ext_resp.status}")
+#
+#     try:
+#         result_text = await ext_resp.text()
+#         result = json.loads(result_text)
+#     except Exception:
+#         return _error(502, "Merge service returned invalid JSON.", origin)
+#
+#     presigned = result.get("presignedUrl")
+#     if not presigned:
+#         return _error(502, "Merge service did not return presignedUrl.", origin)
+#
+#     return _json_response({"presignedUrl": presigned}, 200, origin)
 
 
-async def _fetch_split_with_timeout(
-    split_url: str,
-    body: dict,
-    fetch_timeout_seconds: float,
-):
-    controller = AbortController.new()
-    timeout_ms = max(1, int(fetch_timeout_seconds * 1000))
-    timeout_id = setTimeout(controller.abort, timeout_ms)
-
-    try:
-        ext_resp = await js_fetch(
-            split_url,
-            to_js(
-                {
-                    "method": "POST",
-                    "headers": {"Content-Type": "application/json"},
-                    "body": json.dumps(body),
-                    "signal": controller.signal,
-                },
-                dict_converter=Object.fromEntries,
-            ),
-        )
-        return ext_resp, ""
-    except Exception as exc:
-        error_name = getattr(exc, "name", "")
-        error_text = str(exc)
-        if error_name == "AbortError" or "AbortError" in error_text:
-            return None, f"Split service request timed out after {fetch_timeout_seconds}s."
-        return None, f"Failed to call split service: {exc}"
-    finally:
-        clearTimeout(timeout_id)
-
-
-async def _handle_pdf_splitter(request, env, origin: str) -> Response:
-    # Parse body as passthrough JSON (same pattern as pdf-converter/pdf-merger)
-    try:
-        body = await request.json()
-    except Exception:
-        return _error(400, "Request body must be valid JSON.", origin)
-
-    if not isinstance(body, dict):
-        return _error(400, "Request body must be a JSON object.", origin)
-
-    # Passthrough: forward request body unchanged to the split service
-
-    split_url = getattr(env, "SERVICE_PDF_SPLIT_URL", None)
-    if not split_url:
-        return _error(500, "Missing required environment variable: SERVICE_PDF_SPLIT_URL.", origin)
-
-    fetch_timeout_seconds = DEFAULT_COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS
-    fetch_timeout_raw = getattr(env, "COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS", None)
-    if fetch_timeout_raw is not None:
-        try:
-            configured_timeout = float(fetch_timeout_raw)
-            if configured_timeout > 0:
-                fetch_timeout_seconds = configured_timeout
-        except (TypeError, ValueError):
-            print("[pdf-splitter] invalid COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS; using default")
-
-    print("[pdf-splitter] forwarding request to split service")
-    ext_resp, call_error = await _call_split_service_with_retry(
-        split_url,
-        body,
-        fetch_timeout_seconds,
-    )
-    if ext_resp is None:
-        print(f"[pdf-splitter] external service unavailable: {call_error}")
-        return _error(502, call_error, origin)
-
-    print(f"[pdf-splitter] external response status: {ext_resp.status}")
-
-    try:
-        result_text = await ext_resp.text()
-    except Exception as exc:
-        print(f"[pdf-splitter] invalid response from split service: {exc}")
-        return _error(502, "Split service returned invalid response.", origin)
-
-    # Passthrough: preserve status and Content-Type from service layer when possible
-    headers = {}
-    try:
-        ct = ext_resp.headers.get("Content-Type") or ext_resp.headers.get("content-type")
-        if ct:
-            headers["Content-Type"] = ct
-    except Exception:
-        pass
-
-    if origin:
-        headers.update(_cors_headers(origin))
-
-    return Response(result_text, status=ext_resp.status, headers=headers)
+# --- pdf-splitter (deprecated — feature removed, kept for history) ---
+# async def _call_split_service_with_retry(
+#     split_url: str,
+#     body: dict,
+#     fetch_timeout_seconds: float,
+# ):
+#     deadline = time.monotonic() + MAX_COMPRESS_WAIT_SECONDS
+#     attempt = 0
+#     retry_delay = DEFAULT_INITIAL_RETRY_DELAY_SECONDS
+#     last_error = "Split service did not become ready in time."
+#
+#     print(f"split_url:{split_url}")
+#
+#     while time.monotonic() < deadline:
+#         attempt += 1
+#         ext_resp, fetch_error = await _fetch_split_with_timeout(
+#             split_url,
+#             body,
+#             fetch_timeout_seconds,
+#         )
+#         if ext_resp is None:
+#             last_error = fetch_error
+#
+#         if ext_resp is not None:
+#             if ext_resp.ok:
+#                 return ext_resp, ""
+#
+#             body_text = await ext_resp.text()
+#             if ext_resp.status not in TRANSIENT_STATUS_CODES:
+#                 return None, f"Split service returned {ext_resp.status}: {body_text[:200]}"
+#
+#             last_error = (
+#                 f"Split service temporary failure ({ext_resp.status}): {body_text[:200]}"
+#             )
+#
+#         remaining = deadline - time.monotonic()
+#         if remaining <= 0:
+#             break
+#
+#         sleep_for = min(retry_delay, remaining)
+#         print(f"[pdf-splitter] attempt {attempt} failed, retrying in {sleep_for:.1f}s")
+#         await asyncio.sleep(sleep_for)
+#         retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY_SECONDS)
+#
+#     return None, last_error
+#
+#
+# async def _fetch_split_with_timeout(
+#     split_url: str,
+#     body: dict,
+#     fetch_timeout_seconds: float,
+# ):
+#     controller = AbortController.new()
+#     timeout_ms = max(1, int(fetch_timeout_seconds * 1000))
+#     timeout_id = setTimeout(controller.abort, timeout_ms)
+#
+#     try:
+#         ext_resp = await js_fetch(
+#             split_url,
+#             to_js(
+#                 {
+#                     "method": "POST",
+#                     "headers": {"Content-Type": "application/json"},
+#                     "body": json.dumps(body),
+#                     "signal": controller.signal,
+#                 },
+#                 dict_converter=Object.fromEntries,
+#             ),
+#         )
+#         return ext_resp, ""
+#     except Exception as exc:
+#         error_name = getattr(exc, "name", "")
+#         error_text = str(exc)
+#         if error_name == "AbortError" or "AbortError" in error_text:
+#             return None, f"Split service request timed out after {fetch_timeout_seconds}s."
+#         return None, f"Failed to call split service: {exc}"
+#     finally:
+#         clearTimeout(timeout_id)
+#
+#
+# async def _handle_pdf_splitter(request, env, origin: str) -> Response:
+#     # Parse body as passthrough JSON (same pattern as pdf-converter/pdf-merger)
+#     try:
+#         body = await request.json()
+#     except Exception:
+#         return _error(400, "Request body must be valid JSON.", origin)
+#
+#     if not isinstance(body, dict):
+#         return _error(400, "Request body must be a JSON object.", origin)
+#
+#     # Passthrough: forward request body unchanged to the split service
+#
+#     split_url = getattr(env, "SERVICE_PDF_SPLIT_URL", None)
+#     if not split_url:
+#         return _error(500, "Missing required environment variable: SERVICE_PDF_SPLIT_URL.", origin)
+#
+#     fetch_timeout_seconds = DEFAULT_COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS
+#     fetch_timeout_raw = getattr(env, "COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS", None)
+#     if fetch_timeout_raw is not None:
+#         try:
+#             configured_timeout = float(fetch_timeout_raw)
+#             if configured_timeout > 0:
+#                 fetch_timeout_seconds = configured_timeout
+#         except (TypeError, ValueError):
+#             print("[pdf-splitter] invalid COMPRESSED_PDF_FETCH_TIMEOUT_SECONDS; using default")
+#
+#     print("[pdf-splitter] forwarding request to split service")
+#     ext_resp, call_error = await _call_split_service_with_retry(
+#         split_url,
+#         body,
+#         fetch_timeout_seconds,
+#     )
+#     if ext_resp is None:
+#         print(f"[pdf-splitter] external service unavailable: {call_error}")
+#         return _error(502, call_error, origin)
+#
+#     print(f"[pdf-splitter] external response status: {ext_resp.status}")
+#
+#     try:
+#         result_text = await ext_resp.text()
+#     except Exception as exc:
+#         print(f"[pdf-splitter] invalid response from split service: {exc}")
+#         return _error(502, "Split service returned invalid response.", origin)
+#
+#     # Passthrough: preserve status and Content-Type from service layer when possible
+#     headers = {}
+#     try:
+#         ct = ext_resp.headers.get("Content-Type") or ext_resp.headers.get("content-type")
+#         if ct:
+#             headers["Content-Type"] = ct
+#     except Exception:
+#         pass
+#
+#     if origin:
+#         headers.update(_cors_headers(origin))
+#
+#     return Response(result_text, status=ext_resp.status, headers=headers)
 
 
 # ---------------------------------------------------------------------------
@@ -910,15 +913,15 @@ class Default(WorkerEntrypoint):
                 return await _handle_pdf_converter(request, env, origin)
             return _error(405, "Method Not Allowed: use POST.", origin)
 
-        if path == "/api/v1/pdf-merger":
-            if method == "POST":
-                return await _handle_pdf_merger(request, env, origin)
-            return _error(405, "Method Not Allowed: use POST.", origin)
+        # if path == "/api/v1/pdf-merger":  # deprecated — feature removed
+        #     if method == "POST":
+        #         return await _handle_pdf_merger(request, env, origin)
+        #     return _error(405, "Method Not Allowed: use POST.", origin)
 
-        if path == "/api/v1/pdf-splitter":
-            if method == "POST":
-                return await _handle_pdf_splitter(request, env, origin)
-            return _error(405, "Method Not Allowed: use POST.", origin)
+        # if path == "/api/v1/pdf-splitter":  # deprecated — feature removed
+        #     if method == "POST":
+        #         return await _handle_pdf_splitter(request, env, origin)
+        #     return _error(405, "Method Not Allowed: use POST.", origin)
 
         if path == "/api/v1/blogs":
             if method == "GET":
