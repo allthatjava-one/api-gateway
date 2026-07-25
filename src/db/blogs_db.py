@@ -29,14 +29,67 @@ async def get_blogs(db, limit: int | None = None, offset: int = 0) -> list:
 
 async def get_blog_by_slug(db, slug: str):
     """Fetch a single blog by slug. Returns a dict or None if not found."""
-    row = await db.prepare(
-        "SELECT slug, title, content, createdAt, title_fr, title_es, title_ko, "+
-        "content_fr, content_es, content_ko "+
-        "FROM blogs WHERE slug = ?1"
-    ).bind(slug).first()
+    stmt = (
+        "WITH ordered AS ("
+        "  SELECT slug, title, content, createdAt, title_fr, title_es, title_ko, "
+        "         content_fr, content_es, content_ko, "
+        "         LAG(slug) OVER (ORDER BY createdAt DESC, id ASC) AS previous_slug, "
+        "         LAG(title) OVER (ORDER BY createdAt DESC, id ASC) AS previous_title, "
+        "         LAG(title_fr) OVER (ORDER BY createdAt DESC, id ASC) AS previous_title_fr, "
+        "         LAG(title_es) OVER (ORDER BY createdAt DESC, id ASC) AS previous_title_es, "
+        "         LAG(title_ko) OVER (ORDER BY createdAt DESC, id ASC) AS previous_title_ko, "
+        "         LEAD(slug) OVER (ORDER BY createdAt DESC, id ASC) AS next_slug, "
+        "         LEAD(title) OVER (ORDER BY createdAt DESC, id ASC) AS next_title, "
+        "         LEAD(title_fr) OVER (ORDER BY createdAt DESC, id ASC) AS next_title_fr, "
+        "         LEAD(title_es) OVER (ORDER BY createdAt DESC, id ASC) AS next_title_es, "
+        "         LEAD(title_ko) OVER (ORDER BY createdAt DESC, id ASC) AS next_title_ko "
+        "  FROM blogs"
+        ") SELECT slug, title, content, createdAt, title_fr, title_es, title_ko, "
+        "content_fr, content_es, content_ko, previous_slug, previous_title, previous_title_fr, previous_title_es, previous_title_ko, "
+        "next_slug, next_title, next_title_fr, next_title_es, next_title_ko FROM ordered WHERE slug = ?1"
+    )
+    row = await db.prepare(stmt).bind(slug).first()
     if row is None:
         return None
-    return row.to_py()
+
+    data = row.to_py()
+    # Extract neighboring slugs and reshape into nested objects per API design
+    prev_slug = data.pop("previous_slug", None)
+    prev_title = data.pop("previous_title", None)
+    prev_title_fr = data.pop("previous_title_fr", None)
+    prev_title_es = data.pop("previous_title_es", None)
+    prev_title_ko = data.pop("previous_title_ko", None)
+
+    next_slug = data.pop("next_slug", None)
+    next_title = data.pop("next_title", None)
+    next_title_fr = data.pop("next_title_fr", None)
+    next_title_es = data.pop("next_title_es", None)
+    next_title_ko = data.pop("next_title_ko", None)
+
+    data["previous"] = (
+        {
+            "slug": prev_slug,
+            "title": prev_title,
+            "title_fr": prev_title_fr,
+            "title_es": prev_title_es,
+            "title_ko": prev_title_ko,
+        }
+        if prev_slug
+        else None
+    )
+
+    data["next"] = (
+        {
+            "slug": next_slug,
+            "title": next_title,
+            "title_fr": next_title_fr,
+            "title_es": next_title_es,
+            "title_ko": next_title_ko,
+        }
+        if next_slug
+        else None
+    )
+    return data
 
 
 async def count_blogs(db) -> int:
